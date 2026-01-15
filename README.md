@@ -5,7 +5,7 @@ A tool for generating vulnerability reports and downloading SBOMs for Chainguard
 ## Features
 
 - Fetches vulnerability data for `latest` and `latest-dev` tags
-- Downloads SPDX SBOMs for each image
+- Downloads SPDX SBOMs for all platforms of multi-arch images
 - Enriches vulnerabilities with Chainguard advisory data (CGA IDs and status)
 - Identifies alias tags pointing to the same digest
 - Concurrent processing for fast execution
@@ -16,6 +16,7 @@ A tool for generating vulnerability reports and downloading SBOMs for Chainguard
 - **Python 3.10+**
 - **chainctl**: Chainguard CLI, installed and authenticated
 - **cosign** (optional): Required for SBOM downloads
+- **crane** (optional): Required for multi-arch SBOM downloads
 
 ### Installing chainctl
 
@@ -28,6 +29,14 @@ Follow the [official documentation](https://edu.chainguard.dev/chainguard/chainc
 brew install cosign
 
 # Or download from https://github.com/sigstore/cosign/releases
+```
+
+### Installing crane
+```bash
+# macOS
+brew install crane
+
+# Or see the official installation instructions: https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md
 ```
 
 ## Installation
@@ -74,8 +83,10 @@ Output is written to `output/` by default:
 output/
 ├── vulnerability_report.yaml
 └── sbom/
-    ├── image1_latest.spdx.json
-    ├── image1_latest-dev.spdx.json
+    ├── image1_latest_linux_amd64.spdx.json
+    ├── image1_latest_linux_arm64.spdx.json
+    ├── image1_latest-dev_linux_amd64.spdx.json
+    ├── image1_latest-dev_linux_arm64.spdx.json
     └── ...
 ```
 
@@ -152,7 +163,9 @@ nginx:
       fix-version: null
       cga-id: null
       advisory-status: null
-    sbom-path: output/sbom/nginx_latest.spdx.json
+    sbom-paths:
+      linux/amd64: output/sbom/nginx_latest_linux_amd64.spdx.json
+      linux/arm64: output/sbom/nginx_latest_linux_arm64.spdx.json
   latest-dev:
     digest: sha256:def456...
     alias-tags:
@@ -160,7 +173,9 @@ nginx:
     vulnerability-count: 1
     vulnerabilities:
     - ...
-    sbom-path: output/sbom/nginx_latest-dev.spdx.json
+    sbom-paths:
+      linux/amd64: output/sbom/nginx_latest-dev_linux_amd64.spdx.json
+      linux/arm64: output/sbom/nginx_latest-dev_linux_arm64.spdx.json
 ```
 
 ### Field Descriptions
@@ -179,12 +194,13 @@ nginx:
 | `fix-version` | Version containing the fix |
 | `cga-id` | Chainguard Advisory ID (e.g., CGA-xxxx-xxxx-xxxx) |
 | `advisory-status` | Chainguard advisory status (Fixed, Pending upstream fix, etc.) |
-| `sbom-path` | Path to downloaded SBOM file |
+| `sbom-paths` | Map of platform to downloaded SBOM file path |
 
 ### SBOMs
 
-SBOMs are saved in SPDX 2.3 JSON format:
-- `output/sbom/{image}_{tag}.spdx.json`
+SBOMs are saved in SPDX 2.3 JSON format with platform-specific naming:
+- Multi-arch images: `output/sbom/{image}_{tag}_{os}_{arch}.spdx.json`
+- Single-arch images: `output/sbom/{image}_{tag}.spdx.json`
 
 ## How It Works
 
@@ -196,7 +212,7 @@ SBOMs are saved in SPDX 2.3 JSON format:
 
 4. **Advisory Enrichment**: Fetches Chainguard advisory data (`/advisory/v1/documents`) to add CGA IDs and fix status
 
-5. **SBOM Download**: Uses `cosign download attestation` to fetch SPDX SBOMs from the container registry
+5. **SBOM Download**: Uses `crane manifest` to detect available platforms for multi-arch images, then `cosign download attestation` to fetch SPDX SBOMs for each platform
 
 6. **Report Generation**: Outputs structured YAML report and organizes SBOMs in the output directory
 
@@ -216,6 +232,10 @@ Install chainctl following the [official documentation](https://edu.chainguard.d
 ### "cosign not found"
 
 Install cosign for SBOM downloads, or use `--skip-sbom` to skip SBOM fetching.
+
+### "crane not found"
+
+Install crane for multi-arch platform detection. Without crane, the tool will fall back to downloading a single SBOM per image.
 
 ### "No organizations found"
 

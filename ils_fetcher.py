@@ -52,6 +52,56 @@ def get_auth_token() -> str:
         sys.exit(1)
 
 
+def get_image_platforms(image_ref: str) -> list[str]:
+    """
+    Get available platforms for a multi-arch image.
+
+    Args:
+        image_ref: Full image reference (e.g., cgr.dev/org/image@sha256:...)
+
+    Returns:
+        List of platform strings (e.g., ["linux/amd64", "linux/arm64"])
+        Returns empty list if not a multi-arch image or on error.
+    """
+    try:
+        result = subprocess.run(
+            ["crane", "manifest", image_ref],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+        manifest = json.loads(result.stdout)
+
+        # Check if this is a manifest list/index (multi-arch)
+        media_type = manifest.get("mediaType", "")
+        if "manifest.list" in media_type or "image.index" in media_type:
+            platforms = []
+            for m in manifest.get("manifests", []):
+                platform_info = m.get("platform", {})
+                os_name = platform_info.get("os", "")
+                arch = platform_info.get("architecture", "")
+                variant = platform_info.get("variant", "")
+                if os_name and arch:
+                    platform_str = f"{os_name}/{arch}"
+                    if variant:
+                        platform_str += f"/{variant}"
+                    platforms.append(platform_str)
+            return platforms
+        else:
+            # Single-arch image, return empty to signal no platform iteration needed
+            return []
+
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return []
+    except FileNotFoundError:
+        print(
+            "Warning: crane not found. Platform detection requires crane to be installed.",
+            file=sys.stderr,
+        )
+        return []
+
+
 def download_sbom(
     image_ref: str,
     output_path: Path,
@@ -110,14 +160,15 @@ def download_sbom(
         return False
 
     try:
-        # Try without platform flag first (works for single-arch or when
-        # cosign can resolve the platform automatically)
-        result = run_cosign(use_platform=False)
+        # Always use platform flag to ensure we get the actual platform-specific
+        # SBOM, not the manifest list attestation for multi-arch images
+        result = run_cosign(use_platform=True)
         if result and extract_sbom(result):
             return True
 
-        # If that fails, try with explicit platform flag (for multiarch images)
-        result = run_cosign(use_platform=True)
+        # Fall back to trying without platform flag (for single-arch images
+        # where the platform might not match exactly)
+        result = run_cosign(use_platform=False)
         if result and extract_sbom(result):
             return True
 
@@ -129,6 +180,49 @@ def download_sbom(
             file=sys.stderr,
         )
         return False
+
+
+def download_sboms_all_platforms(
+    image_ref: str,
+    output_dir: Path,
+    base_filename: str,
+) -> dict[str, str]:
+    """
+    Download SBOMs for all platforms of a multi-arch image.
+
+    Args:
+        image_ref: Full image reference (e.g., cgr.dev/org/image@sha256:...)
+        output_dir: Directory to save SBOM files
+        base_filename: Base name for output files (e.g., "nginx_latest")
+
+    Returns:
+        Dictionary mapping platform to saved file path.
+        For single-arch images, returns {"default": path} if successful.
+    """
+    results: dict[str, str] = {}
+
+    # Detect available platforms
+    platforms = get_image_platforms(image_ref)
+
+    if platforms:
+        # Multi-arch image: download SBOM for each platform
+        for platform in platforms:
+            # Create platform-specific filename (e.g., nginx_latest_linux_amd64.spdx.json)
+            platform_suffix = platform.replace("/", "_")
+            sbom_filename = f"{base_filename}_{platform_suffix}.spdx.json"
+            sbom_path = output_dir / sbom_filename
+
+            if download_sbom(image_ref, sbom_path, platform=platform):
+                results[platform] = str(sbom_path)
+    else:
+        # Single-arch image or couldn't detect platforms: try default download
+        sbom_filename = f"{base_filename}.spdx.json"
+        sbom_path = output_dir / sbom_filename
+
+        if download_sbom(image_ref, sbom_path):
+            results["default"] = str(sbom_path)
+
+    return results
 
 
 def get_organizations() -> list[dict[str, Any]]:
@@ -514,13 +608,12 @@ def process_repo(
             "vulnerabilities": vulnerabilities,
         }
 
-        # Download SBOM if requested
+        # Download SBOMs for all platforms if requested
         if sbom_dir and registry_url and digest:
             image_ref = f"{registry_url}/{repo_name}@{digest}"
-            sbom_filename = f"{repo_name}_{tag}.spdx.json".replace("/", "_")
-            sbom_path = sbom_dir / sbom_filename
-            sbom_downloaded = download_sbom(image_ref, sbom_path)
-            image_report[tag]["sbom-path"] = str(sbom_path) if sbom_downloaded else None
+            base_filename = f"{repo_name}_{tag}".replace("/", "_")
+            sbom_paths = download_sboms_all_platforms(image_ref, sbom_dir, base_filename)
+            image_report[tag]["sbom-paths"] = sbom_paths if sbom_paths else None
 
     return repo_name, image_report
 
