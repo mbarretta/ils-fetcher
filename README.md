@@ -16,7 +16,6 @@ A tool for generating vulnerability reports and downloading SBOMs for Chainguard
 - **Python 3.10+**
 - **chainctl**: Chainguard CLI, installed and authenticated
 - **cosign** (optional): Required for SBOM downloads
-- **crane** (optional): Required for multi-arch SBOM downloads
 
 ### Installing chainctl
 
@@ -29,14 +28,6 @@ Follow the [official documentation](https://edu.chainguard.dev/chainguard/chainc
 brew install cosign
 
 # Or download from https://github.com/sigstore/cosign/releases
-```
-
-### Installing crane
-```bash
-# macOS
-brew install crane
-
-# Or see the official installation instructions: https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md
 ```
 
 ## Installation
@@ -66,6 +57,12 @@ pip install -r requirements.txt
 
 ```bash
 chainctl auth login
+```
+
+4. Configure Docker for cgr.dev registry access (required for SBOM downloads):
+
+```bash
+chainctl auth configure-docker
 ```
 
 ## Usage
@@ -212,7 +209,7 @@ SBOMs are saved in SPDX 2.3 JSON format with platform-specific naming:
 
 4. **Advisory Enrichment**: Fetches Chainguard advisory data (`/advisory/v1/documents`) to add CGA IDs and fix status
 
-5. **SBOM Download**: Uses `crane manifest` to detect available platforms for multi-arch images, then `cosign download attestation` to fetch SPDX SBOMs for each platform
+5. **SBOM Download**: Queries the OCI registry API to detect available platforms for multi-arch images, then uses `cosign download attestation` to fetch SPDX SBOMs for each platform
 
 6. **Report Generation**: Outputs structured YAML report and organizes SBOMs in the output directory
 
@@ -233,10 +230,6 @@ Install chainctl following the [official documentation](https://edu.chainguard.d
 
 Install cosign for SBOM downloads, or use `--skip-sbom` to skip SBOM fetching.
 
-### "crane not found"
-
-Install crane for multi-arch platform detection. Without crane, the tool will fall back to downloading a single SBOM per image.
-
 ### "No organizations found"
 
 Verify your account has access to at least one organization:
@@ -244,8 +237,17 @@ Verify your account has access to at least one organization:
 chainctl iam organizations list
 ```
 
+### SBOMs only downloading for one platform
+
+Ensure Docker is configured for cgr.dev registry access:
+```bash
+chainctl auth configure-docker
+```
+
+This sets up the credential helper needed to query the registry for multi-arch platform information.
+
 ### SBOMs not downloading
 
 - Ensure cosign is installed and in your PATH
 - Some images may not have SBOM attestations attached
-- Private registry images require proper authentication via chainctl
+- Ensure Docker is configured for the registry: `chainctl auth configure-docker`

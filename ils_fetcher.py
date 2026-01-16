@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-Chainguard Container Vulnerability Advisory Report Generator
-
 Generates a YAML report of vulnerabilities for all entitled Chainguard Containers
-in an organization, focusing on 'latest' and 'latest-dev' tags.
+in an organization, and downloads SBOMs, for 'latest' and 'latest-dev' tags.
 
 Prerequisites:
     - Must be authenticated via `chainctl auth login`
@@ -16,7 +14,6 @@ Usage:
 import argparse
 import base64
 import json
-import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,34 +24,114 @@ import requests
 import yaml
 
 
-def get_auth_token() -> str:
-    """Get the authentication token from chainctl."""
+def run_chainctl(args: list[str], parse_json: bool = True) -> Any:
+    """
+    Run a chainctl command and return the output.
+
+    Args:
+        args: Command arguments (without 'chainctl' prefix)
+        parse_json: If True, parse output as JSON; otherwise return raw string
+
+    Returns:
+        Parsed JSON data or raw string output
+    """
     try:
         result = subprocess.run(
-            ["chainctl", "auth", "token"],
+            ["chainctl"] + args,
             capture_output=True,
             text=True,
             check=True,
         )
+        if parse_json:
+            return json.loads(result.stdout)
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:
-        print(
-            f"Error: Failed to get auth token. Please run 'chainctl auth login' first.",
-            file=sys.stderr,
-        )
-        print(f"Details: {e.stderr}", file=sys.stderr)
+        print(f"Error running chainctl {args[0]}: {e.stderr}", file=sys.stderr)
         sys.exit(1)
     except FileNotFoundError:
-        print(
-            "Error: chainctl not found. Please install chainctl first.",
-            file=sys.stderr,
-        )
+        print("Error: chainctl not found. Please install chainctl first.", file=sys.stderr)
         sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error parsing chainctl output: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_auth_token() -> str:
+    """Get the authentication token from chainctl."""
+    return run_chainctl(["auth", "token"], parse_json=False)
+
+
+def get_registry_token(registry: str) -> str | None:
+    """
+    Get authentication token for a container registry using Docker credential helpers.
+
+    Args:
+        registry: Registry hostname (e.g., cgr.dev)
+
+    Returns:
+        Bearer token string or None if credentials cannot be obtained.
+    """
+    try:
+        # Use docker-credential-cgr for cgr.dev
+        if "cgr.dev" in registry:
+            result = subprocess.run(
+                ["docker-credential-cgr", "get"],
+                input=registry,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+            creds = json.loads(result.stdout)
+            return creds.get("Secret")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        pass
+
+    return None
+
+
+def parse_image_reference(image_ref: str) -> tuple[str, str, str] | None:
+    """
+    Parse an image reference into registry, repository, and reference components.
+
+    Args:
+        image_ref: Full image reference (e.g., cgr.dev/org/image@sha256:... or cgr.dev/org/image:tag)
+
+    Returns:
+        Tuple of (registry, repository, reference) or None if parsing fails.
+        Reference is either a digest (sha256:...) or a tag.
+    """
+    # Handle digest reference (image@sha256:...)
+    if "@" in image_ref:
+        image_part, reference = image_ref.rsplit("@", 1)
+    elif ":" in image_ref and not image_ref.startswith("sha256:"):
+        # Handle tag reference (image:tag), but be careful with port numbers
+        # Split from the right to handle registry:port/image:tag
+        parts = image_ref.rsplit(":", 1)
+        if "/" in parts[-1]:
+            # The colon was part of registry:port, no tag specified
+            image_part = image_ref
+            reference = "latest"
+        else:
+            image_part, reference = parts
+    else:
+        image_part = image_ref
+        reference = "latest"
+
+    # Split into registry and repository
+    parts = image_part.split("/", 1)
+    if len(parts) != 2:
+        return None
+
+    registry = parts[0]
+    repository = parts[1]
+
+    return registry, repository, reference
 
 
 def get_image_platforms(image_ref: str) -> list[str]:
     """
-    Get available platforms for a multi-arch image.
+    Get available platforms for a multi-arch image using the OCI Registry API.
 
     Args:
         image_ref: Full image reference (e.g., cgr.dev/org/image@sha256:...)
@@ -63,15 +140,35 @@ def get_image_platforms(image_ref: str) -> list[str]:
         List of platform strings (e.g., ["linux/amd64", "linux/arm64"])
         Returns empty list if not a multi-arch image or on error.
     """
+    parsed = parse_image_reference(image_ref)
+    if not parsed:
+        return []
+
+    registry, repository, reference = parsed
+
+    # Get registry token
+    token = get_registry_token(registry)
+    if not token:
+        return []
+
+    # Build the manifest URL
+    url = f"https://{registry}/v2/{repository}/manifests/{reference}"
+
+    # Request manifest with Accept headers for manifest list/index
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": ", ".join([
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+            "application/vnd.oci.image.index.v1+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "application/vnd.oci.image.manifest.v1+json",
+        ]),
+    }
+
     try:
-        result = subprocess.run(
-            ["crane", "manifest", image_ref],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=60,
-        )
-        manifest = json.loads(result.stdout)
+        response = requests.get(url, headers=headers, timeout=60)
+        response.raise_for_status()
+        manifest = response.json()
 
         # Check if this is a manifest list/index (multi-arch)
         media_type = manifest.get("mediaType", "")
@@ -92,13 +189,8 @@ def get_image_platforms(image_ref: str) -> list[str]:
             # Single-arch image, return empty to signal no platform iteration needed
             return []
 
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        return []
-    except FileNotFoundError:
-        print(
-            "Warning: crane not found. Platform detection requires crane to be installed.",
-            file=sys.stderr,
-        )
+    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+        print(f"Warning: Failed to fetch manifest for {image_ref}: {e}", file=sys.stderr)
         return []
 
 
@@ -227,54 +319,14 @@ def download_sboms_all_platforms(
 
 def get_organizations() -> list[dict[str, Any]]:
     """Get the list of organizations the user has access to."""
-    try:
-        result = subprocess.run(
-            ["chainctl", "iam", "organizations", "list", "-o", "json"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        data = json.loads(result.stdout)
-        # Handle the items wrapper in the response
-        orgs = data.get("items", []) if isinstance(data, dict) else data
-        # Filter out the 'chainguard' organization
-        return [org for org in orgs if org.get("name", "").lower() != "chainguard"]
-    except subprocess.CalledProcessError as e:
-        print(f"Error: Failed to list organizations.", file=sys.stderr)
-        print(f"Details: {e.stderr}", file=sys.stderr)
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"Error: Failed to parse organizations response.", file=sys.stderr)
-        print(f"Details: {e}", file=sys.stderr)
-        sys.exit(1)
+    data = run_chainctl(["iam", "organizations", "list", "-o", "json"])
+    orgs = data.get("items", []) if isinstance(data, dict) else data
+    return [org for org in orgs if org.get("name", "").lower() != "chainguard"]
 
 
 def get_images(organization_id: str) -> list[dict[str, Any]]:
     """Get the list of images for an organization."""
-    try:
-        result = subprocess.run(
-            [
-                "chainctl",
-                "images",
-                "list",
-                "--parent",
-                organization_id,
-                "-o",
-                "json",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return json.loads(result.stdout)
-    except subprocess.CalledProcessError as e:
-        print(f"Error: Failed to list images.", file=sys.stderr)
-        print(f"Details: {e.stderr}", file=sys.stderr)
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"Error: Failed to parse images response.", file=sys.stderr)
-        print(f"Details: {e}", file=sys.stderr)
-        sys.exit(1)
+    return run_chainctl(["images", "list", "--parent", organization_id, "-o", "json"])
 
 
 def get_vulnerability_report(
@@ -478,29 +530,6 @@ def parse_vulnerabilities(report: dict[str, Any] | None) -> list[dict[str, Any]]
         vulnerabilities.append(vulnerability_entry)
 
     return vulnerabilities
-
-
-def find_tag_digest(
-    images: list[dict[str, Any]], repo_name: str, tag: str
-) -> str | None:
-    """
-    Find the digest for a specific tag in the images list.
-
-    Args:
-        images: List of images from chainctl
-        repo_name: Repository name to search for
-        tag: Tag to find (e.g., 'latest', 'latest-dev')
-
-    Returns:
-        Digest string or None if not found
-    """
-    for image in images:
-        if image.get("repo", {}).get("name") == repo_name:
-            tags = image.get("tags", [])
-            for t in tags:
-                if t.get("name") == tag:
-                    return t.get("digest")
-    return None
 
 
 def process_repo(
