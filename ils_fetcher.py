@@ -320,7 +320,19 @@ def download_sboms_all_platforms(
 def get_organizations() -> list[dict[str, Any]]:
     """Get the list of organizations the user has access to."""
     data = run_chainctl(["iam", "organizations", "list", "-o", "json"])
-    orgs = data.get("items", []) if isinstance(data, dict) else data
+    if isinstance(data, dict):
+        # Wrapped list: {"items": [...]}
+        if "items" in data and isinstance(data["items"], list):
+            orgs = data["items"]
+        # Single org returned as a plain dict (some chainctl versions)
+        elif "id" in data or "name" in data:
+            orgs = [data]
+        else:
+            orgs = []
+    elif isinstance(data, list):
+        orgs = data
+    else:
+        orgs = []
     return [org for org in orgs if org.get("name", "").lower() != "chainguard"]
 
 
@@ -822,11 +834,17 @@ def main() -> None:
     # Select organization
     selected_org = None
     if args.organization:
-        # Find by name or ID
+        requested = args.organization.strip()
+        # Find by name or ID using progressively looser matching:
+        #   1. Exact match on name or ID
+        #   2. Case-insensitive match on name
         for org in orgs:
+            name = org.get("name", "")
+            oid = org.get("id", "")
             if (
-                org.get("name") == args.organization
-                or org.get("id") == args.organization
+                name == requested
+                or oid == requested
+                or name.lower() == requested.lower()
             ):
                 selected_org = org
                 break
