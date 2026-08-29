@@ -199,6 +199,45 @@ SBOMs are saved in SPDX 2.3 JSON format with platform-specific naming:
 - Multi-arch images: `output/sbom/{image}_{tag}_{os}_{arch}.spdx.json`
 - Single-arch images: `output/sbom/{image}_{tag}.spdx.json`
 
+## Analytics
+
+After generating a report, run `analyze.py` to produce a narrative that explains the
+vulnerability posture — amplification factor, severity breakdown, foundational-package
+attribution (the glibc/openssl/busybox question), top noisy CVEs, image hotspots, fix
+posture, and external-event clusters detected via NVD.
+
+```bash
+python analyze.py
+```
+
+Outputs:
+- `output/analytics_report.md` — markdown narrative
+- `output/analytics_dashboard.html` — self-contained HTML dashboard
+
+Options:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--input` / `-i` | Path to vulnerability report YAML | `output/vulnerability_report.yaml` |
+| `--output-dir` / `-o` | Directory to write analytics artifacts | `output` |
+| `--format` / `-f` | Comma-separated output formats (`md`, `html`) | `md,html` |
+| `--top-n` / `-n` | Rows per ranking table | `10` |
+| `--no-enrich` | Skip NVD enrichment (also disables event clustering) | off |
+| `--no-research` | Skip LLM web research on clusters | off |
+
+Set `NVD_API_KEY` in `.env` (or the environment) to lift NVD's rate limit
+(5 → 50 req/30s). Request a free key at
+https://nvd.nist.gov/developers/request-an-api-key.
+
+Set `ANTHROPIC_API_KEY` in `.env` to enable LLM-driven world-event synthesis on
+detected clusters: each cluster gets a 3-5 sentence narrative explaining the
+real-world event behind it (coordinated security release, AI-assisted research
+drop, news-driven follow-on cascade, etc.) with cited sources from the live web.
+Results are cached in `output/.world_event_cache.json` so reruns are free.
+
+The fetcher also writes a timestamped snapshot of each run to `output/history/`,
+laying the groundwork for trend/spike detection across runs.
+
 ## How It Works
 
 1. **Organization Discovery**: Uses `chainctl iam organizations list` to find available organizations
