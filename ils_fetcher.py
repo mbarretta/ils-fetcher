@@ -14,9 +14,12 @@ Usage:
 import argparse
 import base64
 import json
+import os
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -381,92 +384,110 @@ def get_vulnerability_report(
         return None
 
 
-def get_advisories_for_cves(
-    token: str, cves: list[str]
-) -> dict[str, dict[str, Any]]:
+_STATUS_DISPLAY = {
+    "Detection":                  "Under investigation",
+    "PendingUpstreamFix":          "Pending upstream fix",
+    "FixNotPlanned":               "Fix not planned",
+    "Fixed":                       "Fixed",
+    "FalsePositiveDetermination":  "Not affected",
+    "TruePositiveDetermination":   "Affected",
+}
+
+
+def get_image_advisories(image_ref: str) -> dict[str, dict[str, Any]]:
     """
-    Fetch Chainguard advisories for a list of CVEs.
+    Fetch advisories for every package in an image via ``chainctl image
+    advisories list <image_ref> -o json``.
 
-    Args:
-        token: Authentication token
-        cves: List of CVE IDs to query
+    This is the documented, supported path: Chainguard's advisory database is
+    keyed per-package-per-image, and the ``console-api advisory/v1/documents``
+    bulk-CVE endpoint we used previously returns nothing for org-scoped images.
 
-    Returns:
-        Dictionary mapping CVE ID to advisory info including CGA ID and status
+    Returns a dict keyed by ``(package_name, alias)`` -> advisory info. The
+    ``alias`` key is whatever appeared in the advisory's ``aliases`` array
+    (``CVE-…``, ``GHSA-…``, or ``CGA-…``), so callers can look up by either
+    a real CVE id or a GHSA fallback.
     """
-    if not cves:
-        return {}
-
-    url = "https://console-api.enforce.dev/advisory/v1/documents"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    # Query all CVEs at once - use list of tuples for repeated params
-    # This creates: ?cves=CVE-1&cves=CVE-2 instead of ?cves=CVE-1,CVE-2
-    params = [("cves", cve) for cve in cves]
-
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching advisories: {e}", file=sys.stderr)
+        result = subprocess.run(
+            ["chainctl", "images", "advisories", "list", image_ref, "-o", "json"],
+            check=True, capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.CalledProcessError as e:
+        if os.environ.get("ILS_DEBUG_CGA"):
+            print(f"  [debug] chainctl advisories failed for {image_ref}: "
+                  f"{e.stderr.strip()[:200]}", file=sys.stderr)
         return {}
+    except subprocess.TimeoutExpired:
+        print(f"Warning: chainctl advisories list timed out for {image_ref}",
+              file=sys.stderr)
+        return {}
+
+    stdout = result.stdout
+    # chainctl prints a log line before the JSON; skip to the first bracket.
+    start = stdout.find("[")
+    if start < 0:
+        return {}
+    try:
+        records = json.loads(stdout[start:])
     except json.JSONDecodeError:
-        print("Error: Failed to parse advisories response.", file=sys.stderr)
         return {}
 
-    # Build a lookup: (package_name, cve) -> {cga_id, status, note}
-    advisory_lookup: dict[str, dict[str, Any]] = {}
+    lookup: dict[str, dict[str, Any]] = {}
+    for rec in records:
+        pkg = rec.get("package") or {}
+        pkg_name = pkg.get("name", "")
+        pkg_version = pkg.get("version", "")
+        for adv in rec.get("advisories") or []:
+            aliases = adv.get("aliases", []) or []
+            cga_id = next((a for a in aliases if a.startswith("CGA-")), None)
+            events = adv.get("events", []) or []
 
-    for item in data.get("items", []):
-        package_name = item.get("id", "")
-        for advisory in item.get("advisories", []):
-            cga_id = advisory.get("id", "")
-            aliases = advisory.get("aliases", [])
-            events = advisory.get("events", [])
-
-            # Determine status from the most recent non-detection event
+            # Walk events newest-last and pick the latest non-Detection state.
             status = "Under investigation"
             note = ""
             fixed_version = None
-            status_map = {
-                "pendingUpstreamFix": "Pending upstream fix",
-                "fixNotPlanned": "Fix not planned",
-                "fixed": "Fixed",
-                "falsePositiveDetermination": "Not affected",
-                "truePositiveDetermination": "Affected",
-                "detection": "Under investigation",
-            }
-
             for event in reversed(events):
-                for event_type, display_status in status_map.items():
-                    if event_type in event and event_type != "detection":
-                        status = display_status
-                        event_data = event.get(event_type, {})
-                        if isinstance(event_data, dict):
-                            note = event_data.get("note", "")
-                            # Extract fixedVersion if this is a "fixed" event
-                            if event_type == "fixed":
-                                fixed_version = event_data.get("fixedVersion")
-                        break
+                ev_type = event.get("Type") or {}
+                if not isinstance(ev_type, dict):
+                    continue
+                # Each event has exactly one Type key, e.g. {"PendingUpstreamFix": {...}}
+                for key, data in ev_type.items():
+                    if key == "Detection":
+                        continue
+                    display = _STATUS_DISPLAY.get(key, key)
+                    status = display
+                    if isinstance(data, dict):
+                        note = data.get("note", "") or ""
+                        if key == "Fixed":
+                            fixed_version = data.get("fixedVersion") or data.get("fixed_version")
+                    break
                 if status != "Under investigation":
                     break
 
-            # Map each CVE alias to this advisory info
+            info = {
+                "cga-id":        cga_id,
+                "status":        status,
+                "note":          note,
+                "package":       pkg_name,
+                "package-version": pkg_version,
+                "fixed-version": fixed_version,
+            }
             for alias in aliases:
-                if alias.startswith("CVE-") or alias.startswith("GHSA-"):
-                    key = f"{package_name}:{alias}"
-                    advisory_lookup[key] = {
-                        "cga-id": cga_id,
-                        "status": status,
-                        "note": note,
-                        "package": package_name,
-                        "fixed-version": fixed_version,
-                    }
+                if alias.startswith(("CVE-", "GHSA-", "CGA-")):
+                    lookup[f"{pkg_name}:{alias}"] = info
 
-    return advisory_lookup
+    if os.environ.get("ILS_DEBUG_CGA"):
+        probe = os.environ["ILS_DEBUG_CGA"]
+        hits = sorted(k for k in lookup if probe in k)
+        if hits:
+            print(f"  [debug] {image_ref}: {len(lookup)} keys, sample matching "
+                  f"{probe!r}: {hits[:8]}", file=sys.stderr)
+        else:
+            print(f"  [debug] {image_ref}: {len(lookup)} keys, none matching "
+                  f"{probe!r}", file=sys.stderr)
+
+    return lookup
 
 
 def parse_vulnerabilities(report: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -500,6 +521,7 @@ def parse_vulnerabilities(report: dict[str, Any] | None) -> list[dict[str, Any]]
     for match in matches:
         vuln = match.get("vulnerability", {})
         related = match.get("relatedVulnerabilities", [])
+        artifact = match.get("artifact", {})
 
         # Extract fix information
         fix_info = vuln.get("fix", {})
@@ -530,6 +552,9 @@ def parse_vulnerabilities(report: dict[str, Any] | None) -> list[dict[str, Any]]
             "description": vuln.get("description", ""),
             "fix-available": fix_available,
             "fix-version": fix_versions[0] if fix_versions else None,
+            "package-name": artifact.get("name", "unknown"),
+            "package-version": artifact.get("version", ""),
+            "package-type": artifact.get("type", ""),
         }
 
         # If description is empty, try to get it from related vulnerabilities
@@ -582,45 +607,34 @@ def process_repo(
 
         # Enrich vulnerabilities with advisory info (unless skipped)
         if not skip_advisory:
-            # Collect unique CVE IDs for advisory lookup (only CVE IDs, not GHSA)
-            cve_ids = list(set(
-                v.get("cve-id")
-                for v in vulnerabilities
-                if v.get("cve-id")
-            ))
-
-            # Fetch advisories for these CVEs
-            advisory_lookup = get_advisories_for_cves(token, cve_ids) if cve_ids else {}
-
-            # Build base name for matching (remove common suffixes)
-            base_name = repo_name
-            for suffix in ("-iamguarded-fips", "-iamguarded", "-fips"):
-                if base_name.endswith(suffix):
-                    base_name = base_name[:-len(suffix)]
-                    break
+            image_ref = f"{registry_url}/{repo_name}:{tag}"
+            advisory_lookup = get_image_advisories(image_ref)
 
             for vuln in vulnerabilities:
                 cve_id = vuln.get("cve-id")
+                vuln_id = vuln.get("vulnerability-id")
+                pkg_in_image = vuln.get("package-name") or ""
                 matched_advisory = None
 
-                if cve_id:
-                    # Try matching advisory by package name patterns
-                    for pkg_key, adv_info in advisory_lookup.items():
-                        pkg_name, cve = pkg_key.rsplit(":", 1)
-                        if cve != cve_id:
-                            continue
-
-                        # Match if:
-                        # 1. Exact match (repo_name == pkg_name)
-                        # 2. Base name match (base_name == pkg_name)
-                        # 3. Advisory pkg starts with base name (airflow-2 starts with airflow)
-                        # 4. Base name starts with advisory pkg base (airflow starts with airflow)
-                        pkg_base = pkg_name.rstrip("-0123456789")
-                        if (pkg_name == repo_name or
-                            pkg_name == base_name or
-                            pkg_name.startswith(base_name) or
-                            base_name.startswith(pkg_base)):
-                            matched_advisory = adv_info
+                if pkg_in_image:
+                    # Try CVE id first (the most reliable join), then the raw
+                    # grype identifier (often a GHSA), then a base-name fallback
+                    # for packages whose grype name carries a trailing version
+                    # suffix that the advisory db drops.
+                    candidates = [cve_id, vuln_id]
+                    pkg_candidates = [pkg_in_image]
+                    pkg_base = pkg_in_image.rstrip("-0123456789.")
+                    if pkg_base and pkg_base != pkg_in_image:
+                        pkg_candidates.append(pkg_base)
+                    for pkg in pkg_candidates:
+                        for alias in candidates:
+                            if not alias:
+                                continue
+                            hit = advisory_lookup.get(f"{pkg}:{alias}")
+                            if hit:
+                                matched_advisory = hit
+                                break
+                        if matched_advisory:
                             break
 
                 if matched_advisory:
@@ -666,6 +680,8 @@ def generate_report(
     max_workers: int = 10,
     skip_sbom: bool = False,
     skip_advisory: bool = False,
+    limit: int | None = None,
+    repo_filter: str | None = None,
 ) -> None:
     """
     Generate the vulnerability advisory report.
@@ -697,14 +713,13 @@ def generate_report(
     output_path.mkdir(parents=True, exist_ok=True)
     output_file = output_path / "vulnerability_report.yaml"
 
-    # Set up SBOM downloads - construct registry URL from org name
-    registry_url = None
+    # Construct registry URL — used for both SBOM downloads and per-image
+    # advisory queries via chainctl.
+    registry_url = f"cgr.dev/{organization_name}"
     sbom_path = None
     if not skip_sbom:
         sbom_path = output_path / "sbom"
         sbom_path.mkdir(parents=True, exist_ok=True)
-        # Construct registry URL: cgr.dev/{org_name}
-        registry_url = f"cgr.dev/{organization_name}"
         print(f"SBOM download enabled, saving to: {sbom_path}")
 
     # Group images by repo name and collect all tags
@@ -744,6 +759,11 @@ def generate_report(
                 ]
                 repos[repo_name][target_tag]["alias_tags"] = sorted(alias_tags)
 
+    if repo_filter:
+        repos = {n: t for n, t in repos.items() if repo_filter in n}
+    if limit is not None:
+        repos = dict(list(repos.items())[:limit])
+
     print(f"Found {len(repos)} repositories")
     print(f"Processing with {max_workers} concurrent workers...")
 
@@ -773,17 +793,38 @@ def generate_report(
                 print(f"Error processing {repo_name}: {e}", file=sys.stderr)
                 report[repo_name] = {"error": str(e)}
 
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    output_report = {
+        "_meta": {
+            "generated-at": generated_at,
+            "organization": organization_name,
+            "image-count": len(repos),
+            "tags-scanned": ["latest", "latest-dev"],
+            "skip-sbom": skip_sbom,
+            "skip-advisory": skip_advisory,
+        },
+        **report,
+    }
+
     # Write YAML output
     print(f"Writing report to {output_file}...")
     with open(output_file, "w", encoding="utf-8") as f:
         yaml.dump(
-            report,
+            output_report,
             f,
             default_flow_style=False,
             allow_unicode=True,
             sort_keys=False,
             width=120,
         )
+
+    # Write timestamped snapshot for future trend/diff analysis
+    history_dir = output_path / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    snapshot_file = history_dir / f"vulnerability_report-{timestamp}.yaml"
+    shutil.copy2(output_file, snapshot_file)
+    print(f"Snapshot saved to {snapshot_file}")
 
     print(f"Report generated successfully: {output_file}")
 
@@ -820,6 +861,17 @@ def main() -> None:
         "--skip-advisory",
         action="store_true",
         help="Skip fetching advisory data (CGA IDs and status)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process only the first N repositories (for debugging / smoke tests).",
+    )
+    parser.add_argument(
+        "--repo-filter",
+        default=None,
+        help="Process only repositories whose name contains this substring.",
     )
     args = parser.parse_args()
 
@@ -887,6 +939,8 @@ def main() -> None:
         max_workers=args.workers,
         skip_sbom=args.skip_sbom,
         skip_advisory=args.skip_advisory,
+        limit=args.limit,
+        repo_filter=args.repo_filter,
     )
 
 
